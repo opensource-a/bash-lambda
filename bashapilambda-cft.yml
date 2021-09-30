@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  1S3SourceBucket:
+    Type: String
+    Default: bash-lambda
+    Description: Which s3-bucket contains the Lambda function code?
+  2S3SourceObjectKey:
+    Type: String
+    Default: function.zip
+    Description: Object name of the Lambda function code?    
+  3LambdaMemory:
+    Type: String
+    Default: 1024
+    Description: Lambda Memory Limit in MB
+  4LambdaSubnet1:
+    Type: String
+    Default: subnet-df3b00e1
+    Description: Subnet1 to connect the lambda instance to
+  5LambdaSubnet2:
+    Type: String
+    Default: subnet-fda454a2
+    Description: Subnet2 to connect the lambda instance to
+  6LambdaSecurityGroup:
+    Type: String
+    Default: sg-556c827b
+    Description: Security Group to assign to the Lambda
+  7PermissionsBoundaryArn:
+    Type: String
+    Default: arn:aws:iam::aws:policy/AdministratorAccess
+    Description: Permission Boundary ARN to apply to the roles in the stack    
+Resources:
+  BashLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: !Ref 3LambdaMemory
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref 6LambdaSecurityGroup
+        SubnetIds:
+          - !Ref 4LambdaSubnet1
+          - !Ref 5LambdaSubnet2     
+      Role: !GetAtt 
+        - LambdaRole
+        - Arn
+      Runtime: provided
+      Description: Lambda to execute bash scripts
+      FunctionName: !Sub '${AWS::StackName}-${AWS::AccountId}-BashLambda'
+      Layers:
+        - !Sub 'arn:aws:lambda:${AWS::Region}:744348701589:layer:bash:8'
+      Code:
+        S3Bucket: !Ref 1S3SourceBucket
+        S3Key: !Ref 2S3SourceObjectKey
+    DependsOn:
+      - LambdaRole
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      PermissionsBoundary: !Ref 7PermissionsBoundaryArn
+      Policies:
+        - PolicyName: lambdas3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 'logs:CreateLogGroup'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action: 's3:*'
+                Resource: '*'
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+  BashLambdaApiGatewayRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      ApiKeySourceType: HEADER
+      Description: An API Gateway to integrate with BashLambda
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: !Sub '${AWS::StackName}-${AWS::AccountId}-BashLambda-api'
+    DependsOn:
+      - BashLambda
+  BashLambdaApiGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt 
+        - BashLambdaApiGatewayRestApi
+        - RootResourceId
+      PathPart: execute-bash
+      RestApiId: !Ref BashLambdaApiGatewayRestApi
+    DependsOn:
+      - BashLambda
+  BashLambdaApiGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      HttpMethod: GET
+      RequestParameters:
+        method.request.querystring.s3bucket: true
+        method.request.querystring.s3objectkey: true
+      Integration:
+        ConnectionType: INTERNET
+        Credentials: !GetAtt 
+          - BashLambdaApiGatewayIamRole
+          - Arn
+        IntegrationHttpMethod: POST
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        TimeoutInMillis: 29000
+        RequestTemplates: {"application/json": "{\"queryStringParameters\": {#foreach($key in $input.params().querystring.keySet())#if($foreach.index > 0),#end\"$key\":\"$input.params().querystring.get($key)\"#end}}"}
+        Type: AWS
+        RequestParameters:
+          integration.request.header.X-Amz-Invocation-Type: '''Event'''        
+        Uri: !Sub >-
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BashLambda.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200        
+      OperationName: lambda
+      MethodResponses: 
+        - StatusCode: 200
+      ResourceId: !Ref BashLambdaApiGatewayResource
+      RestApiId: !Ref BashLambdaApiGatewayRestApi
+    DependsOn:
+      - BashLambda
+  BashLambdaApiGatewayModel:
+    Type: 'AWS::ApiGateway::Model'
+    Properties:
+      ContentType: application/json
+      RestApiId: !Ref BashLambdaApiGatewayRestApi
+      Schema: {}
+    DependsOn:
+      - BashLambda
+  BashLambdaApiGatewayStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      DeploymentId: !Ref BashLambdaApiGatewayDeployment
+      Description: BashLambda API Stage v0
+      RestApiId: !Ref BashLambdaApiGatewayRestApi
+      StageName: v0
+    DependsOn:
+      - BashLambda
+  BashLambdaApiGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      Description: BashLambda API Deployment
+      RestApiId: !Ref BashLambdaApiGatewayRestApi
+    DependsOn:
+      - BashLambda
+      - BashLambdaApiGatewayMethod
+  BashLambdaApiGatewayIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      PermissionsBoundary: !Ref 7PermissionsBoundaryArn      
+      Policies:
+        - PolicyName: LambdaAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+    DependsOn:
+      - BashLambda
+  ConfigLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    DependsOn:
+      - BashLambdaApiGatewayRestApi
+      - BashLambda
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref BashLambda
+      Principal: apigateway.amazonaws.com
+Outputs:
+  BashLambdaApiEndpoint:
+    Description: "API endpoint"
+    Value: !Sub "https://${BashLambdaApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${BashLambdaApiGatewayStage}/execute-bash"      
